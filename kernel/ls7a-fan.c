@@ -1,0 +1,553 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * LS7A fan control driver (hwmon)
+ *
+ * Ported from the Loongnix 4.19 kernel tree
+ * (github.com/loongson-community/linux-stable, commit 5a39ab9
+ *  "Ugly workarounds for Loongson-3") to Linux 6.1 (Debian 6.1.176).
+ *
+ * Controls the LS7A platform-bridge PWM fan outputs (4 channels) by
+ * poking the LS7A misc register block directly:
+ *   LS7A_MISC_REG_BASE + 0x20000  (per-channel LOW/FULL/CTRL registers)
+ *
+ * Changes vs 4.19:
+ *  - self-contained: no dependency on the firmware sensors[] table or the
+ *    arch platform.c policy globals; the driver registers its own platform
+ *    devices with a built-in step-speed policy
+ *  - CPU temperature is read directly from LOONGSON_CHIPTEMP (same formula
+ *    as cpu_hwmon's loongson3_cpu_temp), so no symbol export is needed
+ *  - hwmon_device_register() (deprecated) replaced by
+ *    hwmon_device_register_with_info()
+ *
+ * Original authors:
+ *   Sun Ce <sunc@lemote.com>
+ *   Huacai Chen <chenhc@lemote.com>
+ */
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/workqueue.h>
+#include <linux/platform_device.h>
+#include <linux/err.h>
+#include <linux/delay.h>
+#include <linux/hwmon.h>
+#include <linux/hwmon-sysfs.h>
+#include <asm/addrspace.h>
+
+#include <boot_param.h>
+#include <loongson.h>
+#include <loongson_regs.h>
+#include <loongson_hwmon.h>
+
+/* LS7A platform-bridge register base (from loongson-pch.h, 4.19) */
+#define LS7A_PCH_REG_BASE		0x10000000
+#define LS7A_MISC_REG_BASE		(LS7A_PCH_REG_BASE + 0x00080000)
+
+#define LS7A_PWM_REG_BASE		(void *)TO_UNCAC(LS7A_MISC_REG_BASE + 0x20000)
+
+#define LS7A_PWM0_LOW			0x004
+#define LS7A_PWM0_FULL			0x008
+#define LS7A_PWM0_CTRL			0x00c
+
+#define LS7A_PWM1_LOW			0x104
+#define LS7A_PWM1_FULL			0x108
+#define LS7A_PWM1_CTRL			0x10c
+
+#define LS7A_PWM2_LOW			0x204
+#define LS7A_PWM2_FULL			0x208
+#define LS7A_PWM2_CTRL			0x20c
+
+#define LS7A_PWM3_LOW			0x304
+#define LS7A_PWM3_FULL			0x308
+#define LS7A_PWM3_CTRL			0x30c
+
+#define MAX_LS7A_FANS	4
+
+static struct device *pwm_hwmon_dev;
+static enum fan_control_mode ls7a_fan_mode[MAX_LS7A_FANS];
+static struct loongson_fan_policy fan_policy[MAX_LS7A_FANS];
+
+static u8 fan_up_temp[MAX_LS7A_FANS];
+static u8 fan_down_temp[MAX_LS7A_FANS];
+static u8 fan_up_temp_level[MAX_LS7A_FANS];
+static u8 fan_down_temp_level[MAX_LS7A_FANS];
+
+static void fan1_adjust(struct work_struct *work);
+static void fan2_adjust(struct work_struct *work);
+static void fan3_adjust(struct work_struct *work);
+static void fan4_adjust(struct work_struct *work);
+
+#define pwm_read(addr)		readl(LS7A_PWM_REG_BASE + (addr))
+
+#define pwm_write(val, addr)					\
+	do {							\
+		writel(val, LS7A_PWM_REG_BASE + (addr));	\
+		readl(LS7A_PWM_REG_BASE + (addr));		\
+	} while (0)
+
+/*
+ * CPU temperature (same formula as drivers/platform/mips/cpu_hwmon.c:
+ * loongson3_cpu_temp).  Self-contained so this driver does not depend on
+ * a symbol export from cpu_hwmon.
+ */
+static int ls7a_fan_cpu_temp(int cpu)
+{
+	u32 reg, prid_rev;
+
+	reg = LOONGSON_CHIPTEMP(cpu);
+	prid_rev = read_c0_prid() & PRID_REV_MASK;
+
+	switch (prid_rev) {
+	case PRID_REV_LOONGSON3A_R1:
+		reg = (reg >> 8) & 0xff;
+		break;
+	case PRID_REV_LOONGSON3B_R1:
+	case PRID_REV_LOONGSON3B_R2:
+	case PRID_REV_LOONGSON3A_R2_0:
+	case PRID_REV_LOONGSON3A_R2_1:
+		reg = ((reg >> 8) & 0xff) - 100;
+		break;
+	case PRID_REV_LOONGSON3A_R3_0:
+	case PRID_REV_LOONGSON3A_R3_1:
+	default:
+		reg = (reg & 0xffff) * 731 / 0x4000 - 273;
+		break;
+	}
+
+	return (int)reg * 1000;
+}
+
+/* Step-speed policy: 5 temperature bands, 50%..100% (from 4.19 platform.c) */
+static struct loongson_fan_policy step_speed_policy = {
+	.type = STEP_SPEED_POLICY,
+	.adjust_period = 1,
+	.depend_temp = ls7a_fan_cpu_temp,
+	.up_step_num = 5,
+	.down_step_num = 5,
+	.up_step = {
+		{MIN_TEMP, 50,    50},
+		{   50,    60,    60},
+		{   60,    70,    70},
+		{   70,    80,    80},
+		{   80, MAX_TEMP, 100},
+	},
+	.down_step = {
+		{MIN_TEMP, 45,    50},
+		{   45,    55,    60},
+		{   55,    65,    70},
+		{   65,    75,    80},
+		{   75, MAX_TEMP, 100},
+	},
+};
+
+static ssize_t get_fan_level(struct device *dev,
+			     struct device_attribute *attr, char *buf);
+static ssize_t set_fan_level(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count);
+static ssize_t get_fan_mode(struct device *dev,
+			    struct device_attribute *attr, char *buf);
+static ssize_t set_fan_mode(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count);
+
+static SENSOR_DEVICE_ATTR(pwm1, S_IWUSR | S_IRUGO,
+			  get_fan_level, set_fan_level, 1);
+static SENSOR_DEVICE_ATTR(pwm1_enable, S_IWUSR | S_IRUGO,
+			  get_fan_mode, set_fan_mode, 1);
+
+static SENSOR_DEVICE_ATTR(pwm2, S_IWUSR | S_IRUGO,
+			  get_fan_level, set_fan_level, 2);
+static SENSOR_DEVICE_ATTR(pwm2_enable, S_IWUSR | S_IRUGO,
+			  get_fan_mode, set_fan_mode, 2);
+
+static SENSOR_DEVICE_ATTR(pwm3, S_IWUSR | S_IRUGO,
+			  get_fan_level, set_fan_level, 3);
+static SENSOR_DEVICE_ATTR(pwm3_enable, S_IWUSR | S_IRUGO,
+			  get_fan_mode, set_fan_mode, 3);
+
+static SENSOR_DEVICE_ATTR(pwm4, S_IWUSR | S_IRUGO,
+			  get_fan_level, set_fan_level, 4);
+static SENSOR_DEVICE_ATTR(pwm4_enable, S_IWUSR | S_IRUGO,
+			  get_fan_mode, set_fan_mode, 4);
+
+static const struct attribute *ls7a_hwmon_fan[4][3] = {
+	{
+		&sensor_dev_attr_pwm1.dev_attr.attr,
+		&sensor_dev_attr_pwm1_enable.dev_attr.attr,
+		NULL
+	},
+	{
+		&sensor_dev_attr_pwm2.dev_attr.attr,
+		&sensor_dev_attr_pwm2_enable.dev_attr.attr,
+		NULL
+	},
+	{
+		&sensor_dev_attr_pwm3.dev_attr.attr,
+		&sensor_dev_attr_pwm3_enable.dev_attr.attr,
+		NULL
+	},
+	{
+		&sensor_dev_attr_pwm4.dev_attr.attr,
+		&sensor_dev_attr_pwm4_enable.dev_attr.attr,
+		NULL
+	}
+};
+
+static u32 ls7a_get_fan_level(int id)
+{
+	unsigned long low = 0, full = 0;
+
+	if (id == 0) {
+		low = pwm_read(LS7A_PWM0_LOW);
+		full = pwm_read(LS7A_PWM0_FULL);
+	}
+	if (id == 1) {
+		low = pwm_read(LS7A_PWM1_LOW);
+		full = pwm_read(LS7A_PWM1_FULL);
+	}
+	if (id == 2) {
+		low = pwm_read(LS7A_PWM2_LOW);
+		full = pwm_read(LS7A_PWM2_FULL);
+	}
+	if (id == 3) {
+		low = pwm_read(LS7A_PWM3_LOW);
+		full = pwm_read(LS7A_PWM3_FULL);
+	}
+
+	return 255 * (full - low) / full;
+}
+
+static void ls7a_set_fan_level(u8 level, int id)
+{
+	if (id == 0) {
+		pwm_write(255, LS7A_PWM0_FULL);
+		pwm_write(255 - level, LS7A_PWM0_LOW);
+	}
+	if (id == 1) {
+		pwm_write(255, LS7A_PWM1_FULL);
+		pwm_write(255 - level, LS7A_PWM1_LOW);
+	}
+	if (id == 2) {
+		pwm_write(255, LS7A_PWM2_FULL);
+		pwm_write(255 - level, LS7A_PWM2_LOW);
+	}
+	if (id == 3) {
+		pwm_write(255, LS7A_PWM3_FULL);
+		pwm_write(255 - level, LS7A_PWM3_LOW);
+	}
+}
+
+static void get_up_temp(struct loongson_fan_policy *policy,
+			u8 current_temp, u8 *up_temp, u8 *up_temp_level)
+{
+	int i;
+
+	for (i = 0; i < policy->up_step_num; i++) {
+		if (current_temp <= policy->up_step[i].low) {
+			*up_temp = policy->up_step[i].low;
+			*up_temp_level = i;
+			return;
+		}
+	}
+
+	*up_temp = MAX_TEMP;
+	*up_temp_level = policy->up_step_num - 1;
+}
+
+static void get_down_temp(struct loongson_fan_policy *policy, u8 current_temp,
+			  u8 *down_temp, u8 *down_temp_level)
+{
+	int i;
+
+	for (i = policy->down_step_num - 1; i >= 0; i--) {
+		if (current_temp >= policy->down_step[i].high) {
+			*down_temp = policy->down_step[i].high;
+			*down_temp_level = i;
+			return;
+		}
+	}
+
+	*down_temp = MIN_TEMP;
+	*down_temp_level = 0;
+}
+
+static ssize_t get_fan_level(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	int id = (to_sensor_dev_attr(attr))->index - 1;
+	u32 val = ls7a_get_fan_level(id);
+
+	return sprintf(buf, "%d\n", val);
+}
+
+static ssize_t set_fan_level(struct device *dev,
+			     struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	u8 new_speed;
+	int id = (to_sensor_dev_attr(attr))->index - 1;
+
+	if (!ls7a_fan_mode[id])
+		return count;
+
+	if (kstrtou8(buf, 10, &new_speed))
+		return -EINVAL;
+
+	ls7a_set_fan_level(new_speed, id);
+
+	return count;
+}
+
+static ssize_t get_fan_mode(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	int id = (to_sensor_dev_attr(attr))->index - 1;
+
+	return sprintf(buf, "%d\n", ls7a_fan_mode[id]);
+}
+
+static void ls7a_fan_step_mode(get_temp_fun fun,
+			       struct loongson_fan_policy *policy, int id)
+{
+	u8 current_temp;
+	int init_temp_level, target_fan_level;
+
+	current_temp = fun(0) / 1000;
+	get_up_temp(policy, current_temp, &fan_up_temp[id],
+		    &fan_up_temp_level[id]);
+	get_down_temp(policy, current_temp, &fan_down_temp[id],
+		      &fan_down_temp_level[id]);
+
+	/* current speed is not sure, setting now */
+	init_temp_level = (fan_up_temp_level[id] + fan_down_temp_level[id]) / 2;
+	target_fan_level = policy->up_step[init_temp_level].level * 255 / 100;
+	ls7a_set_fan_level(target_fan_level * policy->percent / 100, id);
+
+	schedule_delayed_work_on(0, &policy->work, policy->adjust_period * HZ);
+}
+
+static void ls7a_fan_start_auto(int id)
+{
+	u8 level;
+
+	switch (fan_policy[id].type) {
+	case CONSTANT_SPEED_POLICY:
+		level = fan_policy[id].percent * 255 / 100;
+		if (level > MAX_FAN_LEVEL)
+			level = MAX_FAN_LEVEL;
+		ls7a_set_fan_level(level, id);
+		break;
+	case STEP_SPEED_POLICY:
+		ls7a_fan_step_mode(fan_policy[id].depend_temp, &fan_policy[id], id);
+		break;
+	default:
+		pr_err("ls7a fan not support fan policy id %d!\n", fan_policy[id].type);
+		ls7a_set_fan_level(MAX_FAN_LEVEL, id);
+	}
+}
+
+static void ls7a_fan_stop_auto(int id)
+{
+	if ((fan_policy[id].type == STEP_SPEED_POLICY) &&
+	    (ls7a_fan_mode[id] == FAN_AUTO_MODE))
+		cancel_delayed_work(&fan_policy[id].work);
+}
+
+static ssize_t set_fan_mode(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	int id = (to_sensor_dev_attr(attr))->index - 1;
+	u8 new_mode;
+
+	if (kstrtou8(buf, 10, &new_mode))
+		return -EINVAL;
+
+	new_mode = clamp_val(new_mode, FAN_FULL_MODE, FAN_AUTO_MODE);
+	if (new_mode == ls7a_fan_mode[id])
+		return count;
+
+	switch (new_mode) {
+	case FAN_FULL_MODE:
+		ls7a_fan_stop_auto(id);
+		ls7a_set_fan_level(MAX_FAN_LEVEL, id);
+		break;
+	case FAN_MANUAL_MODE:
+		ls7a_fan_stop_auto(id);
+		break;
+	case FAN_AUTO_MODE:
+		ls7a_fan_start_auto(id);
+		break;
+	default:
+		break;
+	}
+
+	ls7a_fan_mode[id] = new_mode;
+
+	return count;
+}
+
+#define LS7A_FAN_ADJUST(n)						\
+static void fan##n##_adjust(struct work_struct *work)			\
+{									\
+	u8 current_temp;						\
+	int target_fan_level;						\
+									\
+	current_temp = fan_policy[n - 1].depend_temp(0) / 1000;		\
+									\
+	if ((current_temp <= fan_up_temp[n - 1]) &&			\
+	    (current_temp >= fan_down_temp[n - 1]))			\
+		goto exit;						\
+									\
+	if (current_temp > fan_up_temp[n - 1])				\
+		target_fan_level =					\
+			fan_policy[n - 1].up_step[fan_up_temp_level[n - 1]].level * 255 / 100; \
+									\
+	if (current_temp < fan_down_temp[n - 1])			\
+		target_fan_level =					\
+			fan_policy[n - 1].down_step[fan_down_temp_level[n - 1]].level * 255 / 100; \
+									\
+	ls7a_set_fan_level(target_fan_level * fan_policy[n - 1].percent / 100, n - 1); \
+									\
+	get_up_temp(&fan_policy[n - 1], current_temp,			\
+		    &fan_up_temp[n - 1], &fan_up_temp_level[n - 1]);	\
+	get_down_temp(&fan_policy[n - 1], current_temp,			\
+		      &fan_down_temp[n - 1], &fan_down_temp_level[n - 1]); \
+									\
+exit:									\
+	schedule_delayed_work_on(0, &fan_policy[n - 1].work,		\
+				 fan_policy[n - 1].adjust_period * HZ);	\
+}
+
+LS7A_FAN_ADJUST(1)
+LS7A_FAN_ADJUST(2)
+LS7A_FAN_ADJUST(3)
+LS7A_FAN_ADJUST(4)
+
+#define LS7A_FAN_INIT(n, reg)						\
+static void ls7a_fan##n##_init(void)					\
+{									\
+	int ret;							\
+									\
+	pwm_write(1, LS7A_PWM##reg##_CTRL);				\
+	pwm_write(255, LS7A_PWM##reg##_FULL); /* Full = 255, Low + Pwm = 255 */ \
+									\
+	INIT_DEFERRABLE_WORK(&fan_policy[n - 1].work, fan##n##_adjust);	\
+									\
+	/* force fan in auto mode first */				\
+	ls7a_fan_mode[n - 1] = FAN_AUTO_MODE;				\
+	ls7a_fan_start_auto(n - 1);					\
+									\
+	ret = sysfs_create_files(&pwm_hwmon_dev->kobj,			\
+				 ls7a_hwmon_fan[n - 1]);		\
+	if (ret)							\
+		pr_err("fail to create sysfs files\n");			\
+}
+
+LS7A_FAN_INIT(1, 0)
+LS7A_FAN_INIT(2, 1)
+LS7A_FAN_INIT(3, 2)
+LS7A_FAN_INIT(4, 3)
+
+static int ls7a_fan_probe(struct platform_device *dev)
+{
+	int id = dev->id - 1;
+	struct sensor_device *sdev = (struct sensor_device *)dev->dev.platform_data;
+
+	/* get fan policy */
+	switch (sdev->fan_policy) {
+	case STEP_SPEED_POLICY:
+		memcpy(&fan_policy[id], &step_speed_policy,
+		       sizeof(struct loongson_fan_policy));
+		fan_policy[id].percent = sdev->fan_percent;
+		if (fan_policy[id].percent == 0 || fan_policy[id].percent > 100)
+			fan_policy[id].percent = 100;
+		break;
+	case CONSTANT_SPEED_POLICY:
+	default:
+		memcpy(&fan_policy[id], &step_speed_policy,
+		       sizeof(struct loongson_fan_policy));
+		fan_policy[id].type = CONSTANT_SPEED_POLICY;
+		fan_policy[id].percent = sdev->fan_percent;
+		if (fan_policy[id].percent == 0 || fan_policy[id].percent > 100)
+			fan_policy[id].percent = 100;
+		break;
+	}
+
+	if (id == 0)
+		ls7a_fan1_init();
+	if (id == 1)
+		ls7a_fan2_init();
+	if (id == 2)
+		ls7a_fan3_init();
+	if (id == 3)
+		ls7a_fan4_init();
+
+	return 0;
+}
+
+static struct platform_driver pwm_fan_driver = {
+	.probe = ls7a_fan_probe,
+	.driver = {
+		.name = "ls7a-fan",
+	},
+};
+
+/* Self-registered sensor descriptors (4.19 got these from the firmware's
+ * system_loongson.sensors[] table, which 6.1 no longer instantiates). */
+static struct sensor_device ls7a_sensors[MAX_LS7A_FANS] = {
+	{ .name = "ls7a-fan1", .type = SENSOR_FAN, .id = 1,
+	  .fan_policy = STEP_SPEED_POLICY, .fan_percent = 100 },
+	{ .name = "ls7a-fan2", .type = SENSOR_FAN, .id = 2,
+	  .fan_policy = STEP_SPEED_POLICY, .fan_percent = 100 },
+	{ .name = "ls7a-fan3", .type = SENSOR_FAN, .id = 3,
+	  .fan_policy = STEP_SPEED_POLICY, .fan_percent = 100 },
+	{ .name = "ls7a-fan4", .type = SENSOR_FAN, .id = 4,
+	  .fan_policy = STEP_SPEED_POLICY, .fan_percent = 100 },
+};
+
+static int ls7a_fan_init(void)
+{
+	struct platform_device *pdev;
+	int i, ret;
+
+	pwm_hwmon_dev = hwmon_device_register_with_info(NULL, "ls7a-fan",
+							NULL, NULL, NULL);
+	if (IS_ERR(pwm_hwmon_dev)) {
+		ret = PTR_ERR(pwm_hwmon_dev);
+		pr_err("ls7a-fan: hwmon_device_register_with_info failed\n");
+		return ret;
+	}
+
+	ret = platform_driver_register(&pwm_fan_driver);
+	if (ret) {
+		pr_err("ls7a-fan: fail to register fan driver!\n");
+		hwmon_device_unregister(pwm_hwmon_dev);
+		return ret;
+	}
+
+	for (i = 0; i < MAX_LS7A_FANS; i++) {
+		pdev = platform_device_register_data(NULL, "ls7a-fan",
+						     ls7a_sensors[i].id,
+						     &ls7a_sensors[i],
+						     sizeof(ls7a_sensors[i]));
+		if (IS_ERR(pdev))
+			pr_warn("ls7a-fan: failed to register fan%d device\n", i + 1);
+	}
+
+	return 0;
+}
+
+static void ls7a_fan_exit(void)
+{
+	platform_driver_unregister(&pwm_fan_driver);
+	hwmon_device_unregister(pwm_hwmon_dev);
+}
+
+late_initcall(ls7a_fan_init);
+module_exit(ls7a_fan_exit);
+
+MODULE_AUTHOR("Sun Ce <sunc@lemote.com>");
+MODULE_AUTHOR("Huacai Chen <chenhc@lemote.com>");
+MODULE_DESCRIPTION("LS7A fan control driver");
+MODULE_LICENSE("GPL");

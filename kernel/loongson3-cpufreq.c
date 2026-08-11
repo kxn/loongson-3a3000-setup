@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * CPUFreq driver for Loongson-3 processors (3A3000 register method)
+ *
+ * Ported from the Loongnix 4.19 kernel tree
+ * (github.com/loongson-community/linux-stable, commit 5a39ab9
+ *  "Ugly workarounds for Loongson-3") to Linux 6.1 (Debian 6.1.176).
+ *
+ * Original driver covered all Loongson-3 revisions: 3A/3B used the legacy
+ * per-core duty-cycle registers (LOONGSON_FREQCTRL, 4 bits per core),
+ * 3A4000+ switched to an SMC/CSR based method with boost support.  This
+ * port targets the 3A3000 reference machine only, so the SMC/CSR/boost
+ * path (loongson_smc.h, configure_cpufreq_info()) has been removed and
+ * the register method is used unconditionally.
+ *
+ * Frequency setting on 3A3000 (non-R1):
+ *   regval = LOONGSON_FREQCTRL(package)
+ *   regval = (regval & ~(0x7 << (core*4))) | ((level - 1) << (core*4))
+ *   LOONGSON_FREQCTRL(package) = regval
+ * where level = 1..8 and freq = cpu_clock_freq * level / 8.
+ * (R1 cores share one clock per package and use LOONGSON_CHIPCFG instead;
+ *  the branch is kept for completeness.)
+ *
+ * Copyright (C) 2008 - 2014 Lemote Inc.
+ * Author: Yan Hua, yanh@lemote.com
+ *         Chen Huacai, chenhc@lemote.com
+ */
+#include <linux/module.h>
+#include <linux/delay.h>
+#include <linux/cpufreq.h>
+#include <linux/mutex.h>
+
+#include <loongson.h>
+
+static struct mutex cpufreq_mutex[MAX_PACKAGES];
+
+enum freq {
+	DC_ZERO,	/* Reserved */
+	DC_12PT,	/* 1/8  */
+	DC_25PT,	/* 2/8  */
+	DC_37PT,	/* 3/8  */
+	DC_50PT,	/* 4/8  */
+	DC_62PT,	/* 5/8  */
+	DC_75PT,	/* 6/8  */
+	DC_87PT,	/* 7/8  */
+	DC_DISABLE,	/* 8/8 (full speed) */
+	DC_RESV,
+};
+
+static struct cpufreq_frequency_table loongson3_clockmod_table[] = {
+	{0, DC_ZERO, CPUFREQ_ENTRY_INVALID},
+	{0, DC_12PT, 0},
+	{0, DC_25PT, 0},
+	{0, DC_37PT, 0},
+	{0, DC_50PT, 0},
+	{0, DC_62PT, 0},
+	{0, DC_75PT, 0},
+	{0, DC_87PT, 0},
+	{0, DC_DISABLE, 0},
+	{0, DC_RESV, CPUFREQ_TABLE_END},
+};
+
+static unsigned int loongson3_cpufreq_get(unsigned int cpu)
+{
+	unsigned int core_id = cpu_core(&cpu_data[cpu]);
+	unsigned int package_id = cpu_data[cpu].package;
+	u32 regval;
+	u8 level;
+
+	if (!loongson_freqctrl[package_id])
+		return cpu_clock_freq / 1000;
+
+	regval = LOONGSON_FREQCTRL(package_id);
+	level = (regval >> (core_id * 4)) & 0x7;
+
+	return (cpu_clock_freq / 1000) * (level + 1) / 8;
+}
+
+static int loongson3_cpufreq_target(struct cpufreq_policy *policy,
+				    unsigned int index)
+{
+	unsigned int cpu = policy->cpu;
+	unsigned int core_id = cpu_core(&cpu_data[cpu]);
+	unsigned int package_id = cpu_data[cpu].package;
+	u32 regval;
+
+	if (!cpu_online(cpu))
+		return -ENODEV;
+
+	if (!loongson_freqctrl[package_id])
+		return -ENODEV;
+
+	mutex_lock(&cpufreq_mutex[package_id]);
+	regval = LOONGSON_FREQCTRL(package_id);
+	regval = (regval & ~(0x7 << (core_id * 4))) |
+		 ((loongson3_clockmod_table[index].driver_data - 1) << (core_id * 4));
+	LOONGSON_FREQCTRL(package_id) = regval;
+	mutex_unlock(&cpufreq_mutex[package_id]);
+
+	return 0;
+}
+
+static int loongson3_cpufreq_cpu_init(struct cpufreq_policy *policy)
+{
+	if (!cpu_online(policy->cpu))
+		return -ENODEV;
+
+	policy->cur = loongson3_cpufreq_get(policy->cpu);
+	policy->cpuinfo.transition_latency = 1000;
+	policy->freq_table = loongson3_clockmod_table;
+
+	/* Loongson-3A R1: all cores in a package share one clock */
+	if ((read_c0_prid() & PRID_REV_MASK) == PRID_REV_LOONGSON3A_R1)
+		cpumask_copy(policy->cpus, topology_core_cpumask(policy->cpu));
+
+	return 0;
+}
+
+static int loongson3_cpufreq_exit(struct cpufreq_policy *policy)
+{
+	return 0;
+}
+
+static struct cpufreq_driver loongson3_cpufreq_driver = {
+	.name = "loongson3",
+	.init = loongson3_cpufreq_cpu_init,
+	.verify = cpufreq_generic_frequency_table_verify,
+	.target_index = loongson3_cpufreq_target,
+	.get = loongson3_cpufreq_get,
+	.exit = loongson3_cpufreq_exit,
+	.attr = cpufreq_generic_attr,
+};
+
+static int __init cpufreq_init(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_PACKAGES; i++)
+		mutex_init(&cpufreq_mutex[i]);
+
+	/* Fill the clock table: level i (1..8) -> cpu_clock_freq * i / 8 */
+	for (i = DC_12PT; i < DC_RESV; i++)
+		loongson3_clockmod_table[i].frequency = (cpu_clock_freq / 1000) * i / 8;
+
+	return cpufreq_register_driver(&loongson3_cpufreq_driver);
+}
+
+static void __exit cpufreq_exit(void)
+{
+	cpufreq_unregister_driver(&loongson3_cpufreq_driver);
+}
+
+module_init(cpufreq_init);
+module_exit(cpufreq_exit);
+
+MODULE_AUTHOR("Huacai Chen <chenhc@lemote.com>");
+MODULE_DESCRIPTION("CPUFreq driver for Loongson-3A (3A3000, register method)");
+MODULE_LICENSE("GPL");

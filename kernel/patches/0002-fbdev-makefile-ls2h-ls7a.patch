@@ -1,5 +1,5 @@
---- src-inspect/linux-source-6.1/drivers/video/fbdev/Makefile	2026-07-02 21:50:42.000000000 +0800
-+++ kbuild/linux-source-6.1/drivers/video/fbdev/Makefile	2026-08-11 10:56:37.771671872 +0800
+--- a/drivers/video/fbdev/Makefile	2026-07-02 21:50:42.000000000 +0800
++++ b/drivers/video/fbdev/Makefile	2026-08-11 10:56:37.771671872 +0800
 @@ -130,3 +130,6 @@
  
  # the test framebuffer is last

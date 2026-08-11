@@ -1,5 +1,5 @@
---- src-inspect/linux-source-6.1/drivers/video/fbdev/Kconfig	2026-07-02 21:50:42.000000000 +0800
-+++ kbuild/linux-source-6.1/drivers/video/fbdev/Kconfig	2026-08-11 10:56:37.771671872 +0800
+--- a/drivers/video/fbdev/Kconfig	2026-07-02 21:50:42.000000000 +0800
++++ b/drivers/video/fbdev/Kconfig	2026-08-11 10:56:37.771671872 +0800
 @@ -2147,3 +2147,21 @@
  source "drivers/video/fbdev/omap/Kconfig"
  source "drivers/video/fbdev/omap2/Kconfig"
