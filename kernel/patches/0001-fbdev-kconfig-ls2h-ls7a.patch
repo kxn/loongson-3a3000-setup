@@ -1,0 +1,24 @@
+--- src-inspect/linux-source-6.1/drivers/video/fbdev/Kconfig	2026-07-02 21:50:42.000000000 +0800
++++ kbuild/linux-source-6.1/drivers/video/fbdev/Kconfig	2026-08-11 10:56:37.771671872 +0800
+@@ -2147,3 +2147,21 @@
+ source "drivers/video/fbdev/omap/Kconfig"
+ source "drivers/video/fbdev/omap2/Kconfig"
+ source "drivers/video/fbdev/mmp/Kconfig"
++
++config FB_LS2H
++	tristate "Loongson LS2H frame buffer support"
++	depends on FB && MACH_LOONGSON64
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	help
++	  Frame buffer driver for the Loongson LS2H Platform-Bridge.
++
++config FB_LS7A
++	tristate "Loongson LS7A frame buffer support"
++	depends on FB && MACH_LOONGSON64 && PCI
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	help
++	  Frame buffer driver for the Loongson LS7A Platform-Bridge.

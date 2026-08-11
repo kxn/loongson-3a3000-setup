@@ -1,0 +1,9 @@
+# Large binaries — not in git (see per-dir README for hashes + rebuild)
+*.iso
+vmlinuz
+vmlinux
+initrd.gz
+grub.efi
+*.ko
+*.o
+artifacts/
